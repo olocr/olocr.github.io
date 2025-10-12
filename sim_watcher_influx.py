@@ -1,263 +1,337 @@
 import csv
+import os
+import re
 from typing import Dict, List, Set, Tuple
-import numpy as np
 from watchdog.events import PatternMatchingEventHandler
 from watchdog.observers import Observer
 import threading
-import re
-import os
 import time
 from influxdb import InfluxDBClient
 
 home_dir = os.path.expanduser("~")
 lock = threading.Lock()
 
+# ========= 개선된 measurement 매핑 =========
+METRIC_MAPPING = {
+    # RRC 관련
+    'RRC.ConnMean': 'rrc_connection_time',
+    'numActiveUes': 'active_ue_count',
+    
+    # SINR 관련
+    'sameCellSinr': 'sinr_serving',
+    'sameCellSinr3gppencoded': 'sinr_serving_3gpp',
+    'L3 serving SINR': 'sinr_serving_l3',
+    'L3 serving SINR 3gpp': 'sinr_serving_l3_3gpp',
+    'L3 neigh SINR': 'sinr_neighbor_l3',
+    'L3 neigh SINR 3gpp': 'sinr_neighbor_l3_3gpp',
+    
+    # DRB 관련
+    'DRB.EstabSucc.5QI.UEID': 'drb_established_count',
+    'DRB.RelActNbr.5QI.UEID': 'drb_released_count',
+    'DRB.PdcpSduDelayDl': 'pdcp_delay_downlink',
+    
+    # PDCP 전송량
+    'txPdcpPduLteRlc': 'pdcp_tx_count',
+    'rxPdcpPduLteRlc': 'pdcp_rx_count',
+    
+    # 기지국
+    'eNB id': 'enb_id',
+    
+    # 셀 ID
+    'L3 serving Id': 'serving_cell_id',
+    'L3 neigh Id': 'neighbor_cell_id',
+}
 
-class SimWatcher(PatternMatchingEventHandler): #PatternMatchingEventHandler를 상속받아 파일 변경 감시 기능 구현
-    patterns = ['cu-up-cell-*.txt', 'cu-cp-cell-*.txt', "du-cell-*.txt",  'ue_positions.txt'] #감시할 파일 패턴 목록을 정의 // *.txt: 패턴에 맞는 모든 텍스트 파일
-    kpm_map: Dict[Tuple[int, int, int], List] = {} 
-    consumed_keys: Set[Tuple[int, int, int]] 
-    influx_host = "localhost"   # InfluxDB에 연결하기 위한 주소와 로그인 정보 설정
+class ImprovedSimWatcher(PatternMatchingEventHandler):
+    """개선된 시뮬레이션 데이터 감시 클래스"""
+    
+    patterns = ['cu-up-cell-*.txt', 'cu-cp-cell-*.txt', "du-cell-*.txt", 'ue_positions.txt']
+    kpm_map: Dict[Tuple[int, int, int], List] = {}
+    consumed_keys: Set[Tuple[int, int, int]]
+    
+    influx_host = "localhost"
     influx_port = 8086
     influx_user = 'admin'
     influx_password = 'admin'
-    db_name = 'influx'
+    db_name = 'influx'  # 기존 DB 사용 (호환성)
     
-    #client : 데이터베이스와 상호작용하기 위한 InfluxDBClient 객체 생성
-    client = InfluxDBClient( 
+    client = InfluxDBClient(
         host=influx_host,
         port=influx_port,
         username=influx_user,
         password=influx_password,
-        database=db_name)
+        database=db_name
+    )
     
-    #데이터베이스가 존재하지 않으면 생성
     client.create_database(db_name)
 
     def __init__(self, directory):
-        PatternMatchingEventHandler.__init__(self, patterns=self.patterns,
-                                             ignore_patterns=[],
-                                             ignore_directories=True, case_sensitive=False)
+        PatternMatchingEventHandler.__init__(
+            self, 
+            patterns=self.patterns,
+            ignore_patterns=[],
+            ignore_directories=True, 
+            case_sensitive=False
+        )
         self.directory = directory
         self.consumed_keys = set()
-        print("Start Watchdog....")
+        print("개선된 Watchdog 시작...")
 
-    def on_created(self, event): # 파일 생성 이벤트 처리
-        super().on_created(event)
+    def _parse_metric_name(self, field_name: str) -> Tuple[str, str]:
+        """
+        필드 이름을 파싱하여 메트릭명과 타입 추출
+        Returns: (metric_name, metric_type)
+        """
+        # 괄호 내용 제거
+        clean_name = re.sub(r'\([^)]*\)', '', field_name).strip()
+        
+        # 매핑된 이름 찾기
+        for old_name, new_name in METRIC_MAPPING.items():
+            if old_name in field_name:
+                return new_name, self._get_metric_type(new_name)
+        
+        # 매핑되지 않은 경우 원본 사용 (소문자, 공백 제거)
+        metric_name = clean_name.lower().replace(' ', '_').replace('.', '_')
+        return metric_name, self._get_metric_type(metric_name)
+    
+    def _get_metric_type(self, metric_name: str) -> str:
+        """메트릭 타입 분류"""
+        if 'sinr' in metric_name:
+            return 'radio_quality'
+        elif 'delay' in metric_name or 'latency' in metric_name:
+            return 'latency'
+        elif 'drb' in metric_name:
+            return 'bearer'
+        elif 'rrc' in metric_name:
+            return 'connection'
+        elif 'pdcp' in metric_name:
+            return 'throughput'
+        elif 'count' in metric_name or 'ue' in metric_name:
+            return 'statistics'
+        else:
+            return 'other'
 
-    def on_modified(self, event): # 파일 수정 이벤트 처리
-        super().on_modified(event) # 상위 클래스의 on_modified 메서드 호출
+    def _determine_layer(self, file_type: int) -> str:
+        """파일 타입에서 계층 결정"""
+        layer_map = {
+            0: 'cu_up',    # cu-up-cell-[2-5]
+            1: 'cu_cp',    # cu-cp-cell-[2-5]
+            2: 'du',       # du-cell
+            3: 'cu_up',    # cu-up-cell-1 (eNB)
+            4: 'cu_cp',    # cu-cp-cell-1 (eNB)
+        }
+        return layer_map.get(file_type, 'unknown')
 
-        lock.acquire() #스레드 잠금
+    def on_modified(self, event):
+        super().on_modified(event)
+        
+        lock.acquire()
         try:
-            with open(event.src_path, 'r') as file: #수정된 파일을 읽기 모드로 열기
-                if os.path.basename(file.name) == 'ue_positions.txt': #파일 이름이 'ue_positions.txt'인 경우
-                    reader = csv.DictReader(file) #CSV 파일을 딕셔너리 형태로 읽기 위한 DictReader 객체 생성
-                    self._send_positions_to_influx(reader) #UE 위치 데이터를 InfluxDB에 전송
-                    return #함수 종료
+            with open(event.src_path, 'r') as file:
+                # UE 위치 파일 처리
+                if os.path.basename(file.name) == 'ue_positions.txt':
+                    reader = csv.DictReader(file)
+                    self._send_positions_improved(reader)
+                    return
                 
-                
-                reader = csv.DictReader(file) #그 외의 파일인 경우, CSV 파일을 딕셔너리 형태로 읽기 위한 DictReader 객체 생성
-                for row in reader: #각 행에 대해 반복
-                    timestamp = float(row['timestamp'])          # timestamp 열의 값을 실수로 변환
-                    ue_imsi = int(row['ueImsiComplete'])         # ueImsiComplete 열의 값을 정수로 변환
-                    ue = row['ueImsiComplete']                   # ueImsiComplete 열의 값을 문자열로 저장
-                    Fnames = file.name.replace('.txt', '')       # 파일 이름에서 확장자 제거
-                    Fnames = Fnames.split('-')                   # 하이픈(-)으로 분리
-                    cellid = Fnames[-1]                          # 마지막 부분이 셀 ID
-
-                    if re.search('cu-up-cell-[2-5].txt', file.name):    #튜플 형태의 key 생성 // 0 1 2 3 4: file type 구분
-                        key = (timestamp, ue_imsi, 0)
-                    if re.search('cu-cp-cell-[2-5].txt', file.name):
-                        key = (timestamp, ue_imsi, 1)
-                    if re.search('du-cell-[2-5].txt', file.name):
-                        key = (timestamp, ue_imsi, 2)
-                    if re.search('cu-up-cell-1.txt', file.name):
-                        key = (timestamp, ue_imsi, 3)  # to see data for eNB cell
-                    if re.search('cu-cp-cell-1.txt', file.name):
-                        key = (timestamp, ue_imsi, 4)  # same here
-
-                    if key not in self.consumed_keys:   #이미 처리된 키인지 확인
-                        if key not in self.kpm_map:     #새로운 키인 경우, kpm_map에 빈 리스트로 초기화
-                            self.kpm_map[key] = []      
-
-                        fields = list()                 #필드 이름을 저장할 리스트 초기화
-
-                        for column_name in reader.fieldnames:   #각 열 이름에 대해 반복
-                            if row[column_name] == '':          #빈 값인 경우 스킵
-                                continue
-                            self.kpm_map[key].append(float(row[column_name])) #열 값을 실수로 변환하여 kpm_map에 추가
-                            fields.append(column_name)                        # column_name : insert
-
-                        regex = re.search(r"\w*-(\d+)\.txt", file.name) #파일 이름에서 파일 ID 번호 추출
-                        fields.append('file_id_number')                 #필드 이름 리스트에 'file_id_number' 추가
-                        self.kpm_map[key].append(regex.group(1))        #추출한 파일 ID 번호를 kpm_map에 추가
-
-                        self.consumed_keys.add(key)                     #키를 처리된 키 집합에 추가  
-                        print("Write the recived data at xAPP to Influx DB")    
-                        self._send_to_influxDB(ue=ue, serv_cellid = cellid, values=self.kpm_map[key], fields=fields, file_type=key[2]) #데이터를 InfluxDB에 전송
+                # 일반 메트릭 파일 처리
+                reader = csv.DictReader(file)
+                for row in reader:
+                    timestamp = float(row['timestamp'])
+                    ue_imsi = int(row['ueImsiComplete'])
+                    
+                    # 파일명에서 정보 추출
+                    filename = os.path.basename(file.name)
+                    cell_id = filename.split('-')[-1].replace('.txt', '')
+                    
+                    # 파일 타입 결정
+                    file_type = self._get_file_type(filename)
+                    layer = self._determine_layer(file_type)
+                    
+                    key = (timestamp, ue_imsi, file_type)
+                    
+                    if key in self.consumed_keys:
+                        continue
+                    
+                    # 데이터 처리
+                    points = []
+                    current_neighbor_cell = None
+                    
+                    for column_name in reader.fieldnames:
+                        if row[column_name] == '':
+                            continue
+                        
+                        value = float(row[column_name])
+                        
+                        # 메트릭 이름 파싱
+                        metric_name, metric_type = self._parse_metric_name(column_name)
+                        
+                        # 특수 처리: pdcp_delay는 ms 단위로 변환
+                        if 'pdcp_delay' in metric_name or 'PdcpSduDelayDl' in column_name:
+                            value = value * 0.1  # ns to ms
+                        
+                        # 이웃 셀 ID 추적
+                        if 'neighbor_cell_id' in metric_name or 'L3 neigh Id' in column_name:
+                            current_neighbor_cell = str(int(value))
+                        
+                        # 포인트 생성
+                        point = self._create_improved_point(
+                            metric_name=metric_name,
+                            metric_type=metric_type,
+                            value=value,
+                            timestamp=timestamp,
+                            ue_id=str(ue_imsi),
+                            cell_id=cell_id,
+                            neighbor_cell_id=current_neighbor_cell if 'neighbor' in metric_name else None,
+                            layer=layer,
+                            is_cell_metric='UEID' not in column_name and 'L3' not in column_name
+                        )
+                        
+                        points.append(point)
+                    
+                    if points:
+                        self.client.write_points(points)
+                        self.consumed_keys.add(key)
+                        print(f"✓ {len(points)}개 메트릭 저장 (UE:{ue_imsi}, Cell:{cell_id}, Layer:{layer})")
+        
         finally:
-            lock.release() #스레드 잠금 해제
+            lock.release()
 
-    def on_closed(self, event):
-        super().on_closed(event)
-
-    def _send_to_influxDB(self, ue: int, serv_cellid: int, values: List, fields: List, file_type: int): # InfluxDB에 데이터 전송
-        # timestamp 처리 : InfluxDB에 ns 단위로 기록하기 위해 마이크로초 단위로 변환
-        timestamp = int(values[0] * (pow(10, 6))) 
-
-        i = 0
-        influx_points = []
-        cellId = '0'
-        # 한줄씩 처리 ==> UE_ID,
-
-        for field in fields:
-            stat = field # field Name
-            if field == 'file_id_number':
-                continue
-
-            # convert pdcp_latency
-            if field == 'DRB.PdcpSduDelayDl.UEID (pdcpLatency)':
-                values[i] = values[i] * pow(10, -1)
-
-            # UETrace
-            # SINR 처리 : SINR_cell_a_ue_b, Serv_SINR_cell_a_ue_b
-            ### L3 serving SINR,L3 neigh SINR #
-            # 3GPP-SINR 처리 : 3GPP_SINR_cell_a_ue_b, Serv_3GPP_SINR_cell_a_ue_b
-            ### L3 serving SINR 3gpp ,L3 neigh SINR 3gpp # (convertedSinr)
-            # Serving Cell ID UE :Serv_Cellid_ue_b
-            ### L3 serving Id(m_cellId)
-
-            # Cell Trace
-            # numActive UEs
-            #
-            servecell = False
-            if 'L3' in field and 'cellId' in field:
-                cellId = values[i]
-
-            if 'L3 serving Id(m_cellId)' in field:
-                stat = 'Serv_Cellid_ue_'
-
-            elif 'L3 serving SINR' in field and '3gpp' not in field:
-                #stat = stat + '_cell_' + str(int(cellId))
-                stat = 'SINR_cell_' + str(int(cellId))
-                stat_serv = 'Serv_SINR_cell_' + str(int(cellId))
-                servecell = True
-
-            elif 'L3 neigh SINR' in field and '3gpp' not in field:
-                stat = 'SINR_cell_' + str(int(cellId))
-
-            elif 'L3 serving SINR 3gpp' in field:
-                # stat = stat + '_cell_' + str(int(cellId))
-                stat = '3GPP_SINR_cell_' + str(int(cellId))
-                stat_serv = '3GPP_Serv_SINR_cell_' + str(int(cellId))
-                servecell = True
-
-            elif 'L3 neigh SINR 3gpp' in field:
-                stat = '3GPP_SINR_cell_' + str(int(cellId))
-
-            if 'UEID' not in field and 'L3' not in field:
-                # Cell num
-                stat = field + '_cell_' + serv_cellid
-                stat = stat.replace(' ', '')
-                influx_point = {
-                    "measurement": stat,
-                    "tags": {
-                        'timestamp': timestamp
-                    },
-                    "fields": {
-                        "value": values[i]
-                    }
-                }
-                influx_points.append(influx_point)
-                i += 1
-                continue
-
-            stat = stat + '_ue_' + ue
-            if file_type == 0 or file_type == 3:
-                stat += '_up'
-            if file_type == 1 or file_type == 4:
-                stat += '_cp'
-            if file_type == 2:
-                stat += '_du'
-            stat = stat.replace(' ', '')
-            print(stat)
-
-            influx_point = {
-                "measurement": stat,
-                "tags": {
-                    'timestamp': timestamp
-                },
-                "fields": {
-                    "value": values[i]
-                }
+    def _create_improved_point(
+        self,
+        metric_name: str,
+        metric_type: str,
+        value: float,
+        timestamp: float,
+        ue_id: str = None,
+        cell_id: str = None,
+        neighbor_cell_id: str = None,
+        layer: str = None,
+        is_cell_metric: bool = False
+    ) -> Dict:
+        """
+        개선된 데이터 포인트 생성
+        
+        새로운 구조:
+        - measurement: 메트릭 이름만 (예: "sinr_serving", "pdcp_delay_downlink")
+        - tags: cell_id, ue_id, layer, metric_type 등
+        - fields: value만
+        """
+        tags = {
+            'metric_type': metric_type,
+        }
+        
+        # 셀 단위 메트릭
+        if is_cell_metric:
+            tags['cell_id'] = cell_id
+            tags['scope'] = 'cell'
+        # UE 단위 메트릭
+        else:
+            tags['ue_id'] = ue_id
+            tags['cell_id'] = cell_id
+            tags['scope'] = 'ue'
+            if layer:
+                tags['layer'] = layer
+        
+        # 이웃 셀 정보
+        if neighbor_cell_id:
+            tags['neighbor_cell_id'] = neighbor_cell_id
+        
+        return {
+            "measurement": metric_name,
+            "tags": tags,
+            "time": int(timestamp * 1e9),  # ns 단위
+            "fields": {
+                "value": value
             }
+        }
 
-            influx_points.append(influx_point)
-            if servecell:
-                stat_serv = stat_serv + '_ue_' + ue
-                if file_type == 0 or file_type == 3:
-                    stat_serv += '_up'
-                if file_type == 1 or file_type == 4:
-                    stat_serv += '_cp'
-                if file_type == 2:
-                    stat_serv += '_du'
-                stat_serv = stat_serv.replace(' ', '')
-                influx_point = {
-                    "measurement": stat_serv,
-                    "tags": {
-                        'timestamp': timestamp
-                    },
-                    "fields": {
-                        "value": values[i]
-                    }
-                }
-                influx_points.append(influx_point)
-
-            i += 1
-        # pipe.send()
-        self.client.write_points(influx_points)
-
-    def _send_positions_to_influx(self, reader: csv.DictReader): # UE 위치 데이터를 InfluxDB에 전송
-        # InfluxDB에 기록할 포인트 리스트 초기화
+    def _send_positions_improved(self, reader: csv.DictReader):
+        """개선된 위치 데이터 저장"""
         points = []
         for row in reader:
-            # 헤더는 정확히: timestamp, ueImsiComplete, position_x, position_y
             if not row.get('timestamp') or not row.get('ueImsiComplete'):
                 continue
             try:
-                ts = float(row['timestamp'])           # ns-3에서 seconds로 찍었으면 float seconds
+                ts = float(row['timestamp'])
                 ue = str(row['ueImsiComplete']).strip()
                 x = float(row['position_x'])
                 y = float(row['position_y'])
-            except Exception:
-                continue  # 파싱 실패한 라인 스킵
-
-            points.append({
-                "measurement": "UE_Position",
-                "tags": {
-                    "ue": ue
-                },
-                # InfluxDB 1.x: time 필드 + time_precision='n' 로 ns 단위 기록
-                "time": int(ts * 1e9),
-                "fields": {
-                    "x": x,
-                    "y": y
+                
+                point = {
+                    "measurement": "ue_position",
+                    "tags": {
+                        "ue_id": ue,
+                        "metric_type": "location"
+                    },
+                    "time": int(ts * 1e9),
+                    "fields": {
+                        "x": x,
+                        "y": y
+                    }
                 }
-            })
-
+                points.append(point)
+            except Exception:
+                continue
+        
         if points:
-            # ns 단위
             self.client.write_points(points, time_precision='n')
-            print(f"Wrote {len(points)} UE positions to InfluxDB")
-        
-        
+            print(f"✓ {len(points)}개 UE 위치 저장")
+
+    def _get_file_type(self, filename: str) -> int:
+        """파일명에서 타입 결정"""
+        if re.search(r'cu-up-cell-[2-5]\.txt', filename):
+            return 0
+        elif re.search(r'cu-cp-cell-[2-5]\.txt', filename):
+            return 1
+        elif re.search(r'du-cell-[2-5]\.txt', filename):
+            return 2
+        elif re.search(r'cu-up-cell-1\.txt', filename):
+            return 3
+        elif re.search(r'cu-cp-cell-1\.txt', filename):
+            return 4
+        return -1
+
+# ========= 쿼리 예시 =========
+"""
+개선된 구조에서의 쿼리 예시:
+
+1. UE 9의 최신 SINR:
+   SELECT LAST(value) FROM sinr_serving_l3 WHERE ue_id='9'
+
+2. Cell 2의 모든 UE SINR:
+   SELECT LAST(value) FROM sinr_serving_l3 WHERE cell_id='2' GROUP BY ue_id
+
+3. SINR이 -5 이하인 모든 UE:
+   SELECT LAST(value) FROM sinr_serving_l3 WHERE value < -5 GROUP BY ue_id
+
+4. 특정 Layer의 지연시간:
+   SELECT LAST(value) FROM pdcp_delay_downlink WHERE layer='cu_cp' GROUP BY ue_id
+
+5. 타입별 메트릭:
+   SELECT LAST(value) FROM /.*/ WHERE metric_type='radio_quality' GROUP BY *
+
+6. UE 위치:
+   SELECT x, y FROM ue_position WHERE ue_id='9' ORDER BY time DESC LIMIT 1
+
+장점:
+- 쿼리가 훨씬 간결하고 직관적
+- 태그 기반 필터링으로 성능 향상
+- 메트릭 타입별 분류 가능
+- 확장성 향상
+"""
+
 if __name__ == "__main__":
-    directory = os.path.join(home_dir, "nsoran_LLM_mon_ns3") #현재 사용자의 홈 디렉토리를 자동으로 찾기
-    event_handler = SimWatcher(directory)
+    directory = os.path.join(home_dir, "nsoran_LLM_mon_ns3")
+    event_handler = ImprovedSimWatcher(directory)
     observer = Observer()
     observer.schedule(event_handler, directory, recursive=False)
     observer.start()
+    
+    print("\n" + "="*60)
+    print("개선된 InfluxDB 구조로 데이터 저장 중...")
+    print("Database: influx_v2")
+    print("="*60 + "\n")
 
     try:
         while True:
@@ -266,3 +340,4 @@ if __name__ == "__main__":
         observer.stop()
 
     observer.join()
+
