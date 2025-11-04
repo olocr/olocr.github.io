@@ -168,7 +168,7 @@ class ImprovedSimWatcher(PatternMatchingEventHandler):
                         
                         # 특수 처리: pdcp_delay는 ms 단위로 변환
                         if 'pdcp_delay' in metric_name or 'PdcpSduDelayDl' in column_name:
-                            value = value * 0.1  # ns to ms
+                            value = value * 0.1  # ns to ms (이 부분도 확인 필요, 0.1이 맞는지)
                         
                         # 이웃 셀 ID 추적
                         if 'neighbor_cell_id' in metric_name or 'L3 neigh Id' in column_name:
@@ -179,7 +179,7 @@ class ImprovedSimWatcher(PatternMatchingEventHandler):
                             metric_name=metric_name,
                             metric_type=metric_type,
                             value=value,
-                            timestamp=timestamp,
+                            timestamp=timestamp, # ★[수정] 마이크로초(μs) 타임스탬프 전달
                             ue_id=str(ue_imsi),
                             cell_id=cell_id,
                             neighbor_cell_id=current_neighbor_cell if 'neighbor' in metric_name else None,
@@ -190,7 +190,8 @@ class ImprovedSimWatcher(PatternMatchingEventHandler):
                         points.append(point)
                     
                     if points:
-                        self.client.write_points(points)
+                        # ★[수정] 타임스탬프가 나노초(ns)임을 명시
+                        self.client.write_points(points, time_precision='n')
                         self.consumed_keys.add(key)
                         print(f"✓ {len(points)}개 메트릭 저장 (UE:{ue_imsi}, Cell:{cell_id}, Layer:{layer})")
         
@@ -202,7 +203,7 @@ class ImprovedSimWatcher(PatternMatchingEventHandler):
         metric_name: str,
         metric_type: str,
         value: float,
-        timestamp: float,
+        timestamp: float, # ★[수정] 이 타임스탬프는 마이크로초(μs)로 가정
         ue_id: str = None,
         cell_id: str = None,
         neighbor_cell_id: str = None,
@@ -240,20 +241,21 @@ class ImprovedSimWatcher(PatternMatchingEventHandler):
         return {
             "measurement": metric_name,
             "tags": tags,
-            "time": int(timestamp * 1e9),  # ns 단위
+            # ★★★[수정] 마이크로초(μs)를 나노초(ns)로 변환 ( * 1000 ) ★★★
+            "time": int(timestamp * 1000),
             "fields": {
                 "value": value
             }
         }
 
     def _send_positions_improved(self, reader: csv.DictReader):
-        """개선된 위치 데이터 저장"""
+        """개선된 위치 데이터 저장 (이 파일은 '초' 단위로 가정)"""
         points = []
         for row in reader:
             if not row.get('timestamp') or not row.get('ueImsiComplete'):
                 continue
             try:
-                ts = float(row['timestamp'])
+                ts = float(row['timestamp']) # '초' 단위 (e.g., 1762237032.062)
                 ue = str(row['ueImsiComplete']).strip()
                 x = float(row['position_x'])
                 y = float(row['position_y'])
@@ -264,7 +266,7 @@ class ImprovedSimWatcher(PatternMatchingEventHandler):
                         "ue_id": ue,
                         "metric_type": "location"
                     },
-                    "time": int(ts * 1e9),
+                    "time": int(ts * 1e9), # '초'를 '나노초'로 변환
                     "fields": {
                         "x": x,
                         "y": y
@@ -292,37 +294,22 @@ class ImprovedSimWatcher(PatternMatchingEventHandler):
             return 4
         return -1
 
-# ========= 쿼리 예시 =========
-"""
-개선된 구조에서의 쿼리 예시:
-
-1. UE 9의 최신 SINR:
-   SELECT LAST(value) FROM sinr_serving_l3 WHERE ue_id='9'
-
-2. Cell 2의 모든 UE SINR:
-   SELECT LAST(value) FROM sinr_serving_l3 WHERE cell_id='2' GROUP BY ue_id
-
-3. SINR이 -5 이하인 모든 UE:
-   SELECT LAST(value) FROM sinr_serving_l3 WHERE value < -5 GROUP BY ue_id
-
-4. 특정 Layer의 지연시간:
-   SELECT LAST(value) FROM pdcp_delay_downlink WHERE layer='cu_cp' GROUP BY ue_id
-
-5. 타입별 메트릭:
-   SELECT LAST(value) FROM /.*/ WHERE metric_type='radio_quality' GROUP BY *
-
-6. UE 위치:
-   SELECT x, y FROM ue_position WHERE ue_id='9' ORDER BY time DESC LIMIT 1
-
-장점:
-- 쿼리가 훨씬 간결하고 직관적
-- 태그 기반 필터링으로 성능 향상
-- 메트릭 타입별 분류 가능
-- 확장성 향상
-"""
+# ... (쿼리 예시 주석) ...
 
 if __name__ == "__main__":
     directory = os.path.join(home_dir, "nsoran_LLM_mon_ns3")
+    
+    # ★[추가] InfluxDB 연결 시도 (스크립트 시작 시)
+    try:
+        print("InfluxDB 연결 확인 중...")
+        ImprovedSimWatcher.client.ping()
+        print("InfluxDB 연결 성공.")
+    except Exception as e:
+        print(f"!!! InfluxDB 연결 실패: {e}")
+        print("Docker의 InfluxDB 컨테이너가 실행 중인지 확인하세요.")
+        print("sudo docker compose -f .../docker-compose.observability.yml up -d")
+        exit(1) # 연결 실패 시 스크립트 종료
+
     event_handler = ImprovedSimWatcher(directory)
     observer = Observer()
     observer.schedule(event_handler, directory, recursive=False)
@@ -330,7 +317,7 @@ if __name__ == "__main__":
     
     print("\n" + "="*60)
     print("개선된 InfluxDB 구조로 데이터 저장 중...")
-    print("Database: influx_v2")
+    print(f"Database: {ImprovedSimWatcher.db_name}")
     print("="*60 + "\n")
 
     try:
@@ -340,4 +327,3 @@ if __name__ == "__main__":
         observer.stop()
 
     observer.join()
-

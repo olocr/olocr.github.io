@@ -1,0 +1,55 @@
+version: "3.8"
+services:
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama:/root/.ollama
+    # GPU 쓰려면 주석 해제
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - capabilities: [gpu]
+            
+    # ▼▼▼▼▼ [수정됨] ollama 컨테이너도 동일한 네트워크에 연결합니다. ▼▼▼▼▼
+    networks:
+      - observability-net
+    # ▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲
+
+  agent:
+    build: ./agent
+    container_name: llama-influx-agent
+    environment:
+      - OLLAMA_HOST=http://ollama:11434
+      #- INFLUX_HOST=host.docker.internal
+      - INFLUX_HOST=influxdb      # ← 이걸로!
+
+      - INFLUX_PORT=8086
+      - INFLUX_USER=admin
+      - INFLUX_PASS=admin
+      - INFLUX_DB=influx
+    depends_on:
+      - ollama
+    # extra_hosts:
+    #   - "host.docker.internal:host-gateway"   # 호스트 InFLUXDB 접근용
+    tty: true
+    networks:
+      observability-net:
+        aliases: [llama-influx-agent]
+    
+    # Dockerfile의 'ENTRYPOINT'를 강제로 비웁니다.
+    entrypoint: "" 
+    
+    # 'command'를 컨테이너의 메인 프로세스로 실행합니다.
+    command: ["sleep", "infinity"]
+
+volumes:
+  ollama: {}
+
+networks:
+  observability-net:
+    external: true
+
